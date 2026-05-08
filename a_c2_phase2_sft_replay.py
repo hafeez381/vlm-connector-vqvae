@@ -22,9 +22,15 @@
 #   7. Run lambda ablation: lambda in {0, 0.05, 0.2, 0.5}
 #   8. Save checkpoint
 #
+# OOM FIXES:
+#   FIX-1  expandable_segments env var (before torch import)
+#   FIX-2  del train_pixels / test_pixels right after feature extraction
+#   FIX-3  del clip_model BEFORE loading the LM
+#   FIX-4  default batch_size=32, grad_accum=4 (effective batch=128)
+#   FIX-5  torch.cuda.empty_cache() after every optimizer step
 # ============================================================
 
-
+# [FIX-1] Must be set BEFORE any torch import
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -48,7 +54,7 @@ from a_c1_phase1_connector import MLPConnector, count_params, compute_norm_ratio
 
 
 # ============================================================
-# === CLI args
+# === CLI args (not part of assignment spec — helper only) ===
 # ============================================================
 
 def get_args():
