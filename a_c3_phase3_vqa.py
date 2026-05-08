@@ -17,6 +17,7 @@
 #   FIX-1  expandable_segments env var (before torch import)
 #   FIX-2  del train_pixels / test_pixels after feature extraction
 #   FIX-3  del clip_model BEFORE loading the LM
+#   FIX-4  connector.to(device) immediately after loading weights
 # ============================================================
 
 # [FIX-1] Must be set BEFORE any torch import
@@ -59,7 +60,7 @@ def train_phase3(connector, lm_model, tokenizer, clip_features_train,
     Trains connector + LoRA parameters.
 
     Args:
-        connector: MLPConnector (from Phase 2)
+        connector: MLPConnector (from Phase 2), already on device
         lm_model: SmolLM2 with LoRA (from Phase 2)
         tokenizer: LM tokenizer
         clip_features_train: (N, 49, 768) train features
@@ -99,15 +100,12 @@ def train_phase3(connector, lm_model, tokenizer, clip_features_train,
     # OneCycleLR with 10% warmup (same style as Phase 2)
     scheduler = OneCycleLR(optimizer, max_lr=lr,
                            total_steps=total_steps, pct_start=0.1)
-
     # GradScaler for fp16
     scaler = torch.amp.GradScaler("cuda")
 
     metrics     = {"losses": [], "vqa_acc": [], "ppl": []}
     global_step = 0
     start_time  = time.time()
-
-    # Zero grad once before the loop (not inside, avoids discarding first accum)
     optimizer.zero_grad()
 
     epoch_bar = tqdm(range(num_epochs), desc="Epoch", unit="epoch", position=0)
@@ -158,7 +156,6 @@ def train_phase3(connector, lm_model, tokenizer, clip_features_train,
             metrics["losses"].append(loss.item())
             global_step += 1
 
-            # Eval every eval_every steps
             if global_step % eval_every == 0:
                 step_bar.write(f"\n  [Eval @ step {global_step}/{total_steps}]")
                 acc = evaluate_vqa_accuracy(
@@ -179,38 +176,38 @@ def train_phase3(connector, lm_model, tokenizer, clip_features_train,
     return connector, lm_model, metrics
 
 
-# # ============================================================
-# # === A-C3 (Optional) === Unfreeze last 4 CLIP ViT blocks
-# # ============================================================
+# ============================================================
+# === A-C3 (Optional) === Unfreeze last 4 CLIP ViT blocks
+# ============================================================
 
-# def unfreeze_last_clip_blocks(clip_model, n_blocks=4, unfreeze_lr=1e-5):
-#     """
-#     A-C3 (Optional): Unfreeze last 4 CLIP ViT blocks with low lr.
+def unfreeze_last_clip_blocks(clip_model, n_blocks=4, unfreeze_lr=1e-5):
+    """
+    A-C3 (Optional): Unfreeze last 4 CLIP ViT blocks with low lr.
 
-#     This allows the vision encoder to adapt slightly to the task.
-#     Use a separate param group with very low lr (1e-5).
+    This allows the vision encoder to adapt slightly to the task.
+    Use a separate param group with very low lr (1e-5).
 
-#     Args:
-#         clip_model: CLIP model
-#         n_blocks: number of final encoder blocks to unfreeze
-#         unfreeze_lr: learning rate for unfrozen blocks
+    Args:
+        clip_model: CLIP model
+        n_blocks: number of final encoder blocks to unfreeze
+        unfreeze_lr: learning rate for unfrozen blocks
 
-#     Returns:
-#         unfrozen_params: list of unfrozen parameters (for the optimizer)
-#     """
-#     total_layers = len(clip_model.vision_model.encoder.layers)
-#     start_layer  = total_layers - n_blocks
+    Returns:
+        unfrozen_params: list of unfrozen parameters (for the optimizer)
+    """
+    total_layers = len(clip_model.vision_model.encoder.layers)
+    start_layer  = total_layers - n_blocks
 
-#     unfrozen_params = []
-#     for i in range(start_layer, total_layers):
-#         for p in clip_model.vision_model.encoder.layers[i].parameters():
-#             p.requires_grad = True
-#             unfrozen_params.append(p)
+    unfrozen_params = []
+    for i in range(start_layer, total_layers):
+        for p in clip_model.vision_model.encoder.layers[i].parameters():
+            p.requires_grad = True
+            unfrozen_params.append(p)
 
-#     print(f"Unfroze last {n_blocks} CLIP ViT blocks "
-#           f"(layers {start_layer}-{total_layers-1})")
-#     print(f"Unfrozen params: {sum(p.numel() for p in unfrozen_params):,}")
-#     return unfrozen_params
+    print(f"Unfroze last {n_blocks} CLIP ViT blocks "
+          f"(layers {start_layer}-{total_layers-1})")
+    print(f"Unfrozen params: {sum(p.numel() for p in unfrozen_params):,}")
+    return unfrozen_params
 
 
 # ============================================================
@@ -221,8 +218,8 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(SEED)
 
-    # --- Load data and models ---
-    # [FIX-3] Extract CLIP features first, then delete CLIP before loading LM
+    # --- Load data ---
+    # [FIX-3] Extract CLIP features first, delete CLIP, then load LM
     print("Loading data and models...")
     train_subset, test_subset = get_cifar10_subsets()
 
@@ -274,7 +271,12 @@ if __name__ == "__main__":
             torch.load("weights/connector_phaseA1.pt", map_location="cpu")
         )
 
-    # PPL before Phase 3 = denominator for R = PPL_phase3 / PPL_phase2
+    # [FIX-4] Move connector to device immediately after loading.
+    # Without this, evaluate_vqa_accuracy (called before train_phase3)
+    # will crash because the connector weights are on CPU but inputs are on CUDA.
+    connector = connector.to(device)
+
+    # PPL before Phase 3 — denominator for R = PPL_phase3 / PPL_phase2
     ppl_before = compute_ppl(lm_model, tokenizer, alpaca_texts[:100], device)
     print(f"PPL before Phase 3: {ppl_before:.2f}")
 
